@@ -1,7 +1,0 @@
-streamlit>=1.40
-pandas>=2.0
-pypdf>=4.0
-ifcopenshell
-google-genai>=2.23,<3
-neo4j>=5.0.0
-openpyxl>=3.1
