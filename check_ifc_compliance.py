@@ -208,16 +208,42 @@ def _is_true(value):
 # Main extraction
 # ---------------------------------------------------------------------------
 def extract_all_ifc_wall_dimensions(file_path, search_keyword="Wall"):
-    """Extract data for ALL elements whose IFC class or name matches the keyword.
+    """Extract IFC wall components for the canonical ALL_WALLS selection.
 
-    Raises an exception if the IFC file cannot be opened (the caller shows
-    the error). Returns [] if the file opens but nothing matches.
+    The app normalizes natural-language wall descriptions to ALL_WALLS before
+    calling this function. The same IFC class/name rules are therefore used
+    regardless of whether the user typed "wall", "wall systems" or "drywall".
+    Non-canonical keywords retain the original substring-search behaviour.
+
+    Raises an exception if the IFC file cannot be opened. Returns [] if no
+    matching elements are found.
     """
     ifc_file = ifcopenshell.open(file_path)
     unit_scale_to_mm = get_unit_scale_to_mm(ifc_file)
-    keyword = (search_keyword or "").strip().lower()
+    raw_selection = re.sub(r"\s+", " ", str(search_keyword or "")).strip().casefold()
+    all_walls = raw_selection in {
+        "all_walls", "all walls", "wall", "walls", "walling",
+        "wall component", "wall components", "all wall components",
+        "wall structure", "wall structures", "wall system", "wall systems",
+        "wall construction", "wall constructions", "partition", "partitions",
+        "partitioning", "drywall", "dry wall", "dry lining", "plasterboard",
+        "masonry", "brickwork", "blockwork", "trockenbau", "mauerwerk",
+        "mauer", "ziegel", "trennwand", "innenwand", "aussenwand",
+        "außenwand", "fassade", "fassaden", "facade", "façade",
+        "liftwand", "schachtwand", "ifcwall", "ifcwallstandardcase",
+        "ifccurtainwall",
+    }
+    keyword = "wall" if all_walls else raw_selection
     if not keyword:
         return []
+
+    wall_name_pattern = re.compile(
+        r"\b(?:wall|walls|walling|partition|partitions|partitioning|drywall|"
+        r"dry\s+wall|dry\s+lining|plasterboard|masonry|brickwork|blockwork|"
+        r"trockenbau|mauerwerk|mauer|ziegel|trennwand|innenwand|aussenwand|"
+        r"außenwand|fassade|fassaden|facade|façade|liftwand|schachtwand)\b",
+        re.IGNORECASE,
+    )
 
     # --- gather candidates -------------------------------------------------
     candidates = []
@@ -226,10 +252,24 @@ def extract_all_ifc_wall_dimensions(file_path, search_keyword="Wall"):
             continue
         el_type = element.is_a()
         el_name = str(getattr(element, "Name", "") or "")
-        if keyword in el_type.lower():
-            candidates.append(element)
-        elif keyword in el_name.lower() and el_type not in NON_STRUCTURAL_EXCLUDE_TYPES:
-            candidates.append(element)
+
+        if all_walls:
+            # Include IFC wall entities and curtain walls by class, plus other
+            # non-excluded IFC products explicitly named as wall construction.
+            try:
+                is_wall_class = element.is_a("IfcWall") or element.is_a("IfcCurtainWall")
+            except Exception:
+                is_wall_class = el_type in {"IfcWall", "IfcWallStandardCase", "IfcCurtainWall"}
+            if is_wall_class:
+                candidates.append(element)
+            elif el_type not in NON_STRUCTURAL_EXCLUDE_TYPES and wall_name_pattern.search(el_name):
+                candidates.append(element)
+        else:
+            # Preserve the original keyword-search behaviour for existing callers.
+            if keyword in el_type.casefold():
+                candidates.append(element)
+            elif keyword in el_name.casefold() and el_type not in NON_STRUCTURAL_EXCLUDE_TYPES:
+                candidates.append(element)
 
     if not candidates:
         return []
