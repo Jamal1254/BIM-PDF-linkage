@@ -12,6 +12,7 @@ Never put them in the source code or commit them to GitHub.
 """
 
 import os
+import re
 
 import ifcopenshell
 import ifcopenshell.util.element
@@ -80,9 +81,9 @@ class IFCGraphMapper:
     def _session(self):
         return self.driver.session(database=self.database)
 
-    def _run_batches(self, session, query, rows):
+    def _run_batches(self, session, query, rows, **params):
         for start in range(0, len(rows), self.BATCH_SIZE):
-            session.run(query, rows=rows[start:start + self.BATCH_SIZE])
+            session.run(query, rows=rows[start:start + self.BATCH_SIZE], **params)
 
     # -- schema ---------------------------------------------------------------
     def setup_constraints(self):
@@ -90,13 +91,37 @@ class IFCGraphMapper:
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:BIMElement) REQUIRE e.globalId IS UNIQUE")
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:BuildingStorey) REQUIRE s.globalId IS UNIQUE")
             session.run("CREATE INDEX IF NOT EXISTS FOR (m:Material) ON (m.name)")
-
-    def clear_database(self):
-        """Delete EVERYTHING in the target database (fresh audit graph)."""
-        with self._session() as session:
-            session.run("MATCH (n) DETACH DELETE n")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:AuditProject) REQUIRE a.auditId IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:SpecificationClause) REQUIRE c.clauseKey IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:GraphTerm) REQUIRE t.term IS UNIQUE")
 
     # -- upload ---------------------------------------------------------------
+    @staticmethod
+    def _graph_terms(*values):
+        """Normalize IFC names, classes and materials into shared graph terms."""
+        text = " ".join(str(value or "") for value in values)
+        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        text = re.sub(r"\bIfc", " ", text, flags=re.IGNORECASE)
+        terms = {
+            token.lower().strip(".+/-")
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9.+/-]{2,}", text)
+        }
+        stop = {
+            "the", "and", "for", "with", "from", "that", "this", "are", "was",
+            "were", "shall", "should", "must", "will", "into", "over", "under",
+            "all", "any", "not", "has", "have", "its", "their", "than", "then",
+            "each", "name", "unnamed", "type", "element",
+        }
+        terms = {term for term in terms if len(term) >= 3 and term not in stop}
+        low = text.lower()
+        if "wall" in low:
+            terms.add("wall")
+        if "curtainwall" in low or "curtain wall" in low:
+            terms.update({"curtain", "wall"})
+        if "plasterboard" in low or "drywall" in low:
+            terms.update({"plasterboard", "drywall"})
+        return sorted(terms)
+
     @staticmethod
     def _quick_props(product, unit_scale_to_mm):
         """Light-weight width / external flag for elements the audit did not extract."""
@@ -121,7 +146,8 @@ class IFCGraphMapper:
             pass
         return width_mm, is_external
 
-    def upload_ifc_to_graph(self, ifc_filepath, extracted=None, model_id=None):
+    def upload_ifc_to_graph(self, ifc_filepath, extracted=None, model_id=None,
+                            audit_id=None, selected_global_ids=None):
         """Write storeys, elements, containment and material links.
 
         extracted: optional output of extract_all_ifc_wall_dimensions, so
@@ -132,12 +158,13 @@ class IFCGraphMapper:
         ifc_model = ifcopenshell.open(ifc_filepath)
         unit_scale_to_mm = get_unit_scale_to_mm(ifc_model)
         extracted_by_gid = {e["GlobalId"]: e for e in (extracted or [])}
+        selected_global_ids = set(selected_global_ids or extracted_by_gid.keys())
 
         storey_rows = [
             {"gid": s.GlobalId, "name": s.Name or "Unnamed Level"}
             for s in ifc_model.by_type("IfcBuildingStorey")
         ]
-        element_rows, contained_rows, material_rows = [], [], []
+        element_rows, contained_rows, material_rows, element_term_rows = [], [], [], []
 
         for product in ifc_model.by_type("IfcProduct"):
             if product.is_a("IfcSpatialStructureElement"):
@@ -168,6 +195,14 @@ class IFCGraphMapper:
             for mat_name in material_names:
                 material_rows.append({"element_id": gid, "mat_name": mat_name})
 
+            # Only the selected audit elements need term links for retrieval.
+            if gid in selected_global_ids:
+                terms = set(self._graph_terms(product.Name or "", product.is_a()))
+                for mat_name in material_names:
+                    terms.update(self._graph_terms(mat_name))
+                for term in terms:
+                    element_term_rows.append({"element_id": gid, "term": term})
+
         with self._session() as session:
             self._run_batches(
                 session,
@@ -197,51 +232,136 @@ class IFCGraphMapper:
                 "MERGE (e)-[:HAS_MATERIAL]->(m)",
                 material_rows,
             )
+            if selected_global_ids:
+                session.run(
+                    "UNWIND $ids AS gid MATCH (e:BIMElement {globalId: gid}) "
+                    "OPTIONAL MATCH (e)-[old:HAS_TERM]->(:GraphTerm) DELETE old",
+                    ids=sorted(selected_global_ids),
+                )
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r "
+                "MATCH (e:BIMElement {globalId: r.element_id}) "
+                "MERGE (t:GraphTerm {term: r.term}) "
+                "MERGE (e)-[:HAS_TERM]->(t)",
+                element_term_rows,
+            )
+            if audit_id:
+                session.run(
+                    "MERGE (a:AuditProject {auditId: $audit_id}) "
+                    "SET a.modelId = $model_id, a.updatedAt = datetime()",
+                    audit_id=audit_id,
+                    model_id=model_id,
+                )
+                selected_rows = [{"gid": gid} for gid in selected_global_ids]
+                self._run_batches(
+                    session,
+                    "UNWIND $rows AS r "
+                    "MATCH (a:AuditProject {auditId: $audit_id}), "
+                    "(e:BIMElement {globalId: r.gid}) "
+                    "MERGE (a)-[:USES_ELEMENT]->(e)",
+                    selected_rows,
+                    audit_id=audit_id,
+                )
 
         return {
             "storeys": len(storey_rows),
             "elements": len(element_rows),
             "containment_links": len(contained_rows),
             "material_links": len(material_rows),
+            "element_term_links": len(element_term_rows),
+            "selected_audit_elements": len(selected_global_ids),
         }
 
+    # -- specification graph and retrieval -----------------------------------
+    def upload_specification_clauses(self, audit_id, clauses, source_name="specification.pdf"):
+        """Store page-addressable PDF clauses and link their terms into the graph."""
+        with self._session() as session:
+            session.run(
+                "MERGE (a:AuditProject {auditId: $audit_id}) "
+                "SET a.specificationSource = $source_name, a.updatedAt = datetime()",
+                audit_id=audit_id,
+                source_name=source_name,
+            )
+            clause_rows = []
+            term_rows = []
+            for clause in clauses:
+                source_id = str(clause["source_id"])
+                clause_key = f"{audit_id}|{source_id}"
+                clause_rows.append({
+                    "clause_key": clause_key,
+                    "source_id": source_id,
+                    "page": int(clause["page"]),
+                    "text": clause["text"],
+                    "source": source_name,
+                })
+                for term in self._graph_terms(clause["text"]):
+                    term_rows.append({"clause_key": clause_key, "term": term})
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r "
+                "MERGE (c:SpecificationClause {clauseKey: r.clause_key}) "
+                "SET c.sourceId = r.source_id, c.page = r.page, c.text = r.text, c.source = r.source "
+                "WITH c MATCH (a:AuditProject {auditId: $audit_id}) "
+                "MERGE (a)-[:HAS_SPEC_CLAUSE]->(c)",
+                clause_rows,
+                audit_id=audit_id,
+            )
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r "
+                "MATCH (c:SpecificationClause {clauseKey: r.clause_key}) "
+                "MERGE (t:GraphTerm {term: r.term}) "
+                "MERGE (c)-[:MENTIONS_TERM]->(t)",
+                term_rows,
+            )
+        return {"specification_clauses": len(clause_rows), "clause_term_links": len(term_rows)}
+
+    def retrieve_specification_clauses(self, audit_id, limit=100):
+        """Graph traversal: selected IFC walls -> shared terms <- spec clauses."""
+        query = (
+            "MATCH (a:AuditProject {auditId: $audit_id})-[:USES_ELEMENT]->(e:BIMElement) "
+            "MATCH (e)-[:HAS_TERM]->(t:GraphTerm)<-[:MENTIONS_TERM]-(c:SpecificationClause) "
+            "MATCH (a)-[:HAS_SPEC_CLAUSE]->(c) "
+            "WITH c, count(DISTINCT t.term) AS matched_terms, "
+            "collect(DISTINCT e.globalId) AS related_global_ids "
+            "ORDER BY matched_terms DESC, c.page ASC "
+            "RETURN c.sourceId AS source_id, c.page AS page, c.text AS text, "
+            "c.source AS source, matched_terms, related_global_ids "
+            "ORDER BY matched_terms DESC, page ASC LIMIT $limit"
+        )
+        with self._session() as session:
+            result = session.run(query, audit_id=audit_id, limit=int(limit))
+            return [record.data() for record in result]
+
     # -- audit results --------------------------------------------------------
-    def write_audit_results(self, rows):
-        """Store audit results and return the number of graph nodes actually updated.
+    def write_audit_results(self, rows, model_id=None):
+        """Store severity / issue / required thickness on each audited element.
 
         rows: dicts with gid, severity, issueType, issue,
         requiredThicknessMm, widthMm.
         """
-        updated_total = 0
-        query = (
-            "UNWIND $rows AS r MATCH (e:BIMElement {globalId: r.gid}) "
-            "SET e.severity = r.severity, e.issueType = r.issueType, "
-            "e.issue = r.issue, e.requiredThicknessMm = r.requiredThicknessMm, "
-            "e.auditedWidthMm = r.widthMm "
-            "RETURN count(e) AS updated"
-        )
         with self._session() as session:
-            for start in range(0, len(rows), self.BATCH_SIZE):
-                result = session.run(query, rows=rows[start:start + self.BATCH_SIZE])
-                record = result.single()
-                updated_total += int(record["updated"]) if record else 0
-        return updated_total
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r MATCH (e:BIMElement {globalId: r.gid}) "
+                "WHERE $model_id IS NULL OR e.modelId = $model_id "
+                "SET e.severity = r.severity, e.issueType = r.issueType, "
+                "e.issue = r.issue, e.requiredThicknessMm = r.requiredThicknessMm, "
+                "e.auditedWidthMm = r.widthMm",
+                rows,
+                model_id=model_id,
+            )
+        return len(rows)
 
     def severity_summary(self, model_id=None):
-        """Read severity counts back FROM the graph, optionally for one IFC model."""
+        """Read the severity counts back FROM the graph (round-trip check)."""
         with self._session() as session:
-            if model_id is None:
-                result = session.run(
-                    "MATCH (e:BIMElement) WHERE e.severity IS NOT NULL "
-                    "RETURN e.severity AS severity, count(*) AS elements "
-                    "ORDER BY elements DESC"
-                )
-            else:
-                result = session.run(
-                    "MATCH (e:BIMElement) "
-                    "WHERE e.severity IS NOT NULL AND e.modelId = $model_id "
-                    "RETURN e.severity AS severity, count(*) AS elements "
-                    "ORDER BY elements DESC",
-                    model_id=model_id,
-                )
+            result = session.run(
+                "MATCH (e:BIMElement) WHERE e.severity IS NOT NULL "
+                "AND ($model_id IS NULL OR e.modelId = $model_id) "
+                "RETURN e.severity AS severity, count(*) AS elements "
+                "ORDER BY elements DESC",
+                model_id=model_id,
+            )
             return [record.data() for record in result]
