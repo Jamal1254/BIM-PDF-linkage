@@ -13,6 +13,7 @@ Never put them in the source code or commit them to GitHub.
 
 import os
 import re
+import unicodedata
 
 import ifcopenshell
 import ifcopenshell.util.element
@@ -100,13 +101,20 @@ class IFCGraphMapper:
     @staticmethod
     def _graph_terms(*values):
         """Normalize IFC names, classes and materials into shared graph terms."""
-        text = " ".join(str(value or "") for value in values)
-        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        text = unicodedata.normalize("NFKC", " ".join(str(value or "") for value in values))
+        text = re.sub(r"([a-zäöüß])([A-ZÄÖÜ])", r"\1 \2", text)
         text = re.sub(r"\bIfc", " ", text, flags=re.IGNORECASE)
+        # Unicode-aware: German/French/Spanish words (Dämmung, béton) stay whole.
         terms = {
             token.lower().strip(".+/-")
-            for token in re.findall(r"[A-Za-z][A-Za-z0-9.+/-]{2,}", text)
+            for token in re.findall(r"[^\W\d_][\w.+/-]{2,}", text)
         }
+        # Also index ASCII spellings (Dämmung -> daemmung) because IFC names and PDFs mix them.
+        for term in list(terms):
+            folded = (term.replace("ä", "ae").replace("ö", "oe")
+                          .replace("ü", "ue").replace("ß", "ss"))
+            if folded != term:
+                terms.add(folded)
         stop = {
             "the", "and", "for", "with", "from", "that", "this", "are", "was",
             "were", "shall", "should", "must", "will", "into", "over", "under",
