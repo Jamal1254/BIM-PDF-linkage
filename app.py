@@ -49,7 +49,7 @@ SPEC_SEARCH_TERMS_BASE = [
 MIN_CHUNK_LEN = 40
 MAX_CONTEXT_CHARS = 120000
 MIN_MATCHED_CHUNKS = 3
-BUILD_VERSION = "2026-11-08-graphrag-bridge-v1"
+BUILD_VERSION = "2026-11-09-graphrag-category-links-v2"
 
 
 def chunk_page_text(text):
@@ -471,15 +471,36 @@ def run_audit_pipeline(ifc_file, pdf_file, keyword, tolerance_mm, gemini_key,
                     clause_stats = graph_mapper.upload_specification_clauses(
                         audit_id, spec_clauses, source_name=pdf_file.name
                     )
-                    retrieved_clauses = graph_mapper.retrieve_specification_clauses(
-                        audit_id, limit=120
+                    # Category layer: every IFC category becomes a graph node with
+                    # its own terms (IFC words + German/English construction aliases).
+                    cat_terms, cat_gids = {}, {}
+                    for c in categories:
+                        terms = set(graph_mapper._graph_terms(c["key"], c["ifc_class"]))
+                        terms.update(graph_mapper._graph_terms(" ".join(sm._category_clause_terms(c))))
+                        terms -= {"internal", "unspecified"}
+                        cat_terms[c["id"]] = sorted(terms)
+                        cat_gids[c["id"]] = [i["GlobalId"] for i in cat_elements[c["key"]] if i.get("GlobalId")]
+                    cat_stats = graph_mapper.upload_categories(audit_id, categories, cat_terms, cat_gids)
+
+                    # Per-category graph retrieval: the LLM later sees ONLY these clauses.
+                    by_category = graph_mapper.retrieve_candidates_by_category(
+                        audit_id, per_category=sm.MAX_CANDIDATE_CLAUSES
                     )
+                    retrieved_clauses, seen_ids = [], set()
+                    for c in categories:
+                        hits = by_category.get(c["id"], [])
+                        c["graph_candidate_ids"] = [h["source_id"] for h in hits]
+                        for h in hits:
+                            if h["source_id"] not in seen_ids:
+                                seen_ids.add(h["source_id"])
+                                retrieved_clauses.append({**h, "matched_terms": h.get("score", 0),
+                                                          "source": pdf_file.name})
                     spec_context, matched, truncated = format_graph_retrieval_context(retrieved_clauses)
                     audit.update(
-                        graph_stats={**graph_stats, **clause_stats},
+                        graph_stats={**graph_stats, **clause_stats, **cat_stats},
                         graph_retrieved_clauses=retrieved_clauses,
                         graph_retrieval_count=len(retrieved_clauses),
-                        graph_retrieval_mode="Neo4j shared-term graph traversal",
+                        graph_retrieval_mode="Neo4j per-category graph traversal (Category -> terms <- Clause)",
                         model_id=model_id,
                         audit_id=audit_id,
                         spec_context=spec_context,
@@ -579,6 +600,9 @@ def run_audit_pipeline(ifc_file, pdf_file, keyword, tolerance_mm, gemini_key,
                     ]
                     audit["graph_stats"]["audit_rows_written"] = graph_mapper.write_audit_results(
                         graph_rows, model_id=model_id
+                    )
+                    audit["graph_stats"]["verified_links_written"] = graph_mapper.write_verified_links(
+                        audit_id, requirements, prompt_revision=sm.PROMPT_REVISION
                     )
                     audit["graph_readback"] = graph_mapper.severity_summary(model_id=model_id)
                 except Exception as exc:
