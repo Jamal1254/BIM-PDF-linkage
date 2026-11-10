@@ -39,6 +39,10 @@ def get_secret(name, default=""):
         return default
 
 
+_primary_model = get_secret("GEMINI_MODEL")
+if _primary_model:
+    sm.LLM_MODELS = tuple(dict.fromkeys((str(_primary_model).strip(),) + tuple(sm.LLM_MODELS)))
+
 # Specific wall-construction terms. Very common words ("wall", "mm") are left
 # out on purpose: they match almost every paragraph and defeat the fallback.
 SPEC_SEARCH_TERMS_BASE = [
@@ -49,7 +53,7 @@ SPEC_SEARCH_TERMS_BASE = [
 MIN_CHUNK_LEN = 40
 MAX_CONTEXT_CHARS = 120000
 MIN_MATCHED_CHUNKS = 3
-BUILD_VERSION = "2026-11-10-graphrag-category-links-v3"
+BUILD_VERSION = "2026-11-10-graphrag-category-links-v4"
 
 
 def chunk_page_text(text):
@@ -109,7 +113,14 @@ def diagnose_mapping(spec_context, truncated, has_client, llm_error, requirement
             "unsupported requirement rejected" in str(r.get("note", "")).lower()
             for r in requirements
         ),
-        "no_clause_found": sum(not bool(r.get("spec_found")) for r in requirements),
+        "applicability_guard_rejected": sum(
+            str(r.get("note", "")).lower().startswith("rejected:") for r in requirements
+        ),
+        "no_clause_found": sum(
+            not bool(r.get("spec_found"))
+            and not str(r.get("note", "")).lower().startswith("rejected:")
+            for r in requirements
+        ),
     }
     reasons = []
     actions = []
@@ -220,6 +231,49 @@ def extract_spec_context(pdf_file, search_keyword):
 
 
 
+_NUMBERED_RE = re.compile(r"^(?:\d+(?:\.\d+){1,4}|\d+[.)]|[A-Z][.)]|\([a-z0-9]{1,3}\))\s+[A-Z(]")
+
+
+def _split_unbulleted_page(raw_text, target_chars=1000):
+    """Split a page that has no bullets: by clause numbers (1.2.3 ...), else by sentence groups."""
+    lines = [" ".join(line.split()) for line in (raw_text or "").splitlines()]
+    lines = [line for line in lines if line]
+    groups, current = [], []
+    for line in lines:
+        if _NUMBERED_RE.match(line) and current:
+            groups.append(" ".join(current))
+            current = []
+        current.append(line)
+    if current:
+        groups.append(" ".join(current))
+    merged, carry = [], ""
+    for group in groups:  # attach very short headings to the text that follows
+        group = (carry + " " + group).strip() if carry else group
+        carry = ""
+        if len(group) < MIN_CHUNK_LEN:
+            carry = group
+        else:
+            merged.append(group)
+    if carry:
+        if merged:
+            merged[-1] += " " + carry
+        else:
+            merged.append(carry)
+    if len(merged) > 1:
+        return merged
+    sentences = re.split(r"(?<=[.;:])\s+(?=[A-Z0-9(])", " ".join(lines))
+    chunks, cur = [], ""
+    for sentence in sentences:
+        if cur and len(cur) + len(sentence) + 1 > target_chars:
+            chunks.append(cur)
+            cur = sentence
+        else:
+            cur = (cur + " " + sentence).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def extract_all_spec_clauses(pdf_file):
     """Extract page-addressable clause chunks from the complete PDF for graph indexing.
 
@@ -241,6 +295,11 @@ def extract_all_spec_clauses(pdf_file):
         page_clauses = [part for part in page_clauses if len(part) >= MIN_CHUNK_LEN]
         if not page_clauses and len(clean) >= MIN_CHUNK_LEN:
             page_clauses = [clean]
+        if len(page_clauses) <= 1 and len(clean) > 1200:
+            # No bullets on a long page (typical of numbered or plain-prose specifications).
+            alternative = [c for c in _split_unbulleted_page(raw) if len(c) >= MIN_CHUNK_LEN]
+            if len(alternative) > 1:
+                page_clauses = alternative
         for clause_num, clause_text in enumerate(page_clauses, start=1):
             output.append({
                 "source_id": f"P{page_num}-C{clause_num}",
@@ -565,6 +624,13 @@ def run_audit_pipeline(ifc_file, pdf_file, keyword, tolerance_mm, gemini_key,
                 )
             req_by_id = {r["category_id"]: r for r in requirements}
             audit["llm_meta"] = llm_meta
+            if llm_meta.get("fallback_used"):
+                first_error = (llm_meta.get("llm_error_log") or ["no error recorded"])[0]
+                audit["warnings"].append(
+                    f"The primary model ({llm_meta.get('primary_model')}) failed for at least one call; "
+                    f"results include answers from: {', '.join(llm_meta.get('models_used') or [])}. "
+                    f"First error: {first_error}"
+                )
 
             # M4: deterministic matching + severity
             st.write("⚖️ Step 4/5: deterministic matching and severity classification")
