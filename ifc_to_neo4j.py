@@ -94,6 +94,7 @@ class IFCGraphMapper:
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:AuditProject) REQUIRE a.auditId IS UNIQUE")
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:SpecificationClause) REQUIRE c.clauseKey IS UNIQUE")
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:GraphTerm) REQUIRE t.term IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (k:WallCategory) REQUIRE k.catKey IS UNIQUE")
 
     # -- upload ---------------------------------------------------------------
     @staticmethod
@@ -333,6 +334,145 @@ class IFCGraphMapper:
         with self._session() as session:
             result = session.run(query, audit_id=audit_id, limit=int(limit))
             return [record.data() for record in result]
+
+
+    # -- category layer: the BIM <-> PDF link --------------------------------
+    def upload_categories(self, audit_id, categories, cat_terms, cat_element_ids):
+        """Store each IFC category as a node, linked to its elements and terms.
+
+        categories:      [{'id','key','ifc_class','is_external'}, ...]
+        cat_terms:       {category_id: [term, ...]}
+        cat_element_ids: {category_id: [globalId, ...]}
+        """
+        cat_rows, term_rows, member_rows = [], [], []
+        for c in categories:
+            cat_key = f"{audit_id}|{c['id']}"
+            cat_rows.append({
+                "cat_key": cat_key, "cat_id": int(c["id"]), "name": c["key"],
+                "ifc_class": c["ifc_class"], "is_external": bool(c["is_external"]),
+            })
+            term_rows += [{"cat_key": cat_key, "term": t} for t in cat_terms.get(c["id"], [])]
+            member_rows += [{"cat_key": cat_key, "gid": g} for g in cat_element_ids.get(c["id"], [])]
+        with self._session() as session:
+            # Re-running the same audit rebuilds its categories (and their links).
+            session.run(
+                "MATCH (a:AuditProject {auditId: $audit_id})-[:HAS_CATEGORY]->(k:WallCategory) "
+                "DETACH DELETE k",
+                audit_id=audit_id,
+            )
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r MERGE (k:WallCategory {catKey: r.cat_key}) "
+                "SET k.catId = r.cat_id, k.name = r.name, k.ifcClass = r.ifc_class, "
+                "k.isExternal = r.is_external "
+                "WITH k MATCH (a:AuditProject {auditId: $audit_id}) MERGE (a)-[:HAS_CATEGORY]->(k)",
+                cat_rows,
+                audit_id=audit_id,
+            )
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r MATCH (k:WallCategory {catKey: r.cat_key}) "
+                "MERGE (t:GraphTerm {term: r.term}) MERGE (k)-[:HAS_TERM]->(t)",
+                term_rows,
+            )
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r MATCH (k:WallCategory {catKey: r.cat_key}), "
+                "(e:BIMElement {globalId: r.gid}) MERGE (e)-[:IN_CATEGORY]->(k)",
+                member_rows,
+            )
+        return {"categories": len(cat_rows), "category_term_links": len(term_rows),
+                "category_element_links": len(member_rows)}
+
+    def retrieve_candidates_by_category(self, audit_id, per_category=12, neighbours=4):
+        """Graph traversal per category: Category -> shared terms <- Clause.
+
+        Returns {category_id: [clause dicts]}. The LLM may only cite clauses
+        returned here for that category.
+        """
+        query = (
+            "MATCH (a:AuditProject {auditId: $audit_id})-[:HAS_CATEGORY]->(k:WallCategory)"
+            "-[:HAS_TERM]->(t:GraphTerm)<-[:MENTIONS_TERM]-(c:SpecificationClause)"
+            "<-[:HAS_SPEC_CLAUSE]-(a) "
+            "WITH k, c, count(DISTINCT t) AS score, collect(DISTINCT t.term) AS shared "
+            "ORDER BY k.catId ASC, score DESC, c.page ASC, c.sourceId ASC "
+            "WITH k, collect({source_id: c.sourceId, page: c.page, text: c.text, "
+            "score: score, shared_terms: shared}) AS hits "
+            "RETURN k.catId AS category_id, hits[0..$limit] AS clauses ORDER BY category_id"
+        )
+        with self._session() as session:
+            result = {r["category_id"]: r["clauses"]
+                      for r in session.run(query, audit_id=audit_id, limit=int(per_category))}
+
+            # Adjacent clauses on the same page give section context (as before).
+            wanted = set()
+            for hits in result.values():
+                have = {h["source_id"] for h in hits}
+                added = 0
+                for h in hits:
+                    m = re.fullmatch(r"P(\d+)-C(\d+)", h["source_id"])
+                    if not m:
+                        continue
+                    page, num = int(m.group(1)), int(m.group(2))
+                    for n in (num - 1, num + 1):
+                        nid = f"P{page}-C{n}"
+                        if n > 0 and nid not in have and added < neighbours:
+                            wanted.add(nid)
+                            have.add(nid)
+                            added += 1
+            neighbour_rows = {}
+            if wanted:
+                rows = session.run(
+                    "MATCH (a:AuditProject {auditId: $audit_id})-[:HAS_SPEC_CLAUSE]->(c) "
+                    "WHERE c.sourceId IN $ids "
+                    "RETURN c.sourceId AS source_id, c.page AS page, c.text AS text",
+                    audit_id=audit_id, ids=sorted(wanted),
+                )
+                neighbour_rows = {r["source_id"]: r.data() for r in rows}
+
+        for cid, hits in result.items():
+            have = {h["source_id"] for h in hits}
+            for h in list(hits):
+                m = re.fullmatch(r"P(\d+)-C(\d+)", h["source_id"])
+                if not m:
+                    continue
+                page, num = int(m.group(1)), int(m.group(2))
+                for n in (num - 1, num + 1):
+                    nid = f"P{page}-C{n}"
+                    if nid in neighbour_rows and nid not in have:
+                        row = neighbour_rows[nid]
+                        hits.append({**row, "score": 0, "shared_terms": []})
+                        have.add(nid)
+        return result
+
+    def write_verified_links(self, audit_id, requirements, prompt_revision=""):
+        """Persist evidence-verified (Category)-[:GOVERNED_BY]->(Clause) links."""
+        rows = []
+        for r in requirements:
+            if not (r.get("spec_found") and r.get("evidence_verified") and r.get("source_id")):
+                continue
+            rows.append({
+                "cat_key": f"{audit_id}|{r['category_id']}",
+                "clause_key": f"{audit_id}|{r['source_id']}",
+                "thickness": r.get("required_thickness_mm"),
+                "materials": list(r.get("required_materials") or []),
+                "quote": r.get("evidence_quote") or "",
+                "ref": r.get("clause_reference") or "",
+            })
+        with self._session() as session:
+            self._run_batches(
+                session,
+                "UNWIND $rows AS r "
+                "MATCH (k:WallCategory {catKey: r.cat_key}), "
+                "(c:SpecificationClause {clauseKey: r.clause_key}) "
+                "MERGE (k)-[l:GOVERNED_BY]->(c) "
+                "SET l.requiredThicknessMm = r.thickness, l.requiredMaterials = r.materials, "
+                "l.evidenceQuote = r.quote, l.clauseReference = r.ref, l.verified = true, "
+                "l.promptRevision = $rev, l.linkedAt = datetime()",
+                rows,
+                rev=prompt_revision,
+            )
+        return len(rows)
 
     # -- audit results --------------------------------------------------------
     def write_audit_results(self, rows, model_id=None):
