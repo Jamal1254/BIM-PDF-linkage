@@ -446,7 +446,11 @@ class IFCGraphMapper:
         return result
 
     def write_verified_links(self, audit_id, requirements, prompt_revision=""):
-        """Persist evidence-verified (Category)-[:GOVERNED_BY]->(Clause) links."""
+        """Persist evidence-grounded (Category)-[:GOVERNED_BY]->(Clause) links.
+
+        Grounded = the cited clause exists and contains the reported values.
+        It does not prove the clause applies; review high-severity findings.
+        """
         rows = []
         for r in requirements:
             if not (r.get("spec_found") and r.get("evidence_verified") and r.get("source_id")):
@@ -467,7 +471,7 @@ class IFCGraphMapper:
                 "(c:SpecificationClause {clauseKey: r.clause_key}) "
                 "MERGE (k)-[l:GOVERNED_BY]->(c) "
                 "SET l.requiredThicknessMm = r.thickness, l.requiredMaterials = r.materials, "
-                "l.evidenceQuote = r.quote, l.clauseReference = r.ref, l.verified = true, "
+                "l.evidenceQuote = r.quote, l.clauseReference = r.ref, l.evidenceGrounded = true, "
                 "l.promptRevision = $rev, l.linkedAt = datetime()",
                 rows,
                 rev=prompt_revision,
