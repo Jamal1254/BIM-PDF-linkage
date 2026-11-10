@@ -49,7 +49,7 @@ SPEC_SEARCH_TERMS_BASE = [
 MIN_CHUNK_LEN = 40
 MAX_CONTEXT_CHARS = 120000
 MIN_MATCHED_CHUNKS = 3
-BUILD_VERSION = "2026-11-09-graphrag-category-links-v2"
+BUILD_VERSION = "2026-11-10-graphrag-category-links-v3"
 
 
 def chunk_page_text(text):
@@ -755,7 +755,7 @@ def render_results(audit, gemini_key):
         st.text(audit.get("spec_context") or "No specification text available.")
     if audit.get("graph_retrieved_clauses"):
         with st.expander(f"🕸️ Neo4j GraphRAG retrieval details ({len(audit['graph_retrieved_clauses'])} clauses)"):
-            st.caption("Clauses were retrieved by traversing shared terms between selected IFC wall elements and specification-clause nodes.")
+            st.caption("Clauses were retrieved per IFC category by traversing shared terms between category nodes and specification-clause nodes. Score 0 = neighbouring clause added for context.")
             for clause in audit["graph_retrieved_clauses"]:
                 st.markdown(
                     f"**{clause['source_id']} · Page {clause['page']} · "
