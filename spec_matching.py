@@ -468,6 +468,14 @@ def _category_clause_terms(category):
 def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_CLAUSES):
     """Rank source-identified PDF clauses for one category; never decides applicability."""
     blocks = _source_blocks(spec_context)
+    # GraphRAG mode: Neo4j already chose this category's candidates. Use exactly
+    # those clauses; no keyword fallback outside the graph.
+    graph_ids = category.get("graph_candidate_ids")
+    if graph_ids is not None:
+        def _order(source_id):
+            m = re.fullmatch(r"P(\d+)-C(\d+)", source_id)
+            return tuple(map(int, m.groups())) if m else (10**9, 10**9)
+        return [(sid, blocks[sid]) for sid in sorted(set(graph_ids), key=_order) if sid in blocks]
     terms = _category_clause_terms(category)
     scored = []
     for source_id, clause in blocks.items():
@@ -563,6 +571,14 @@ def extract_requirements(client, spec_context, categories, variant="A"):
             )
 
         by_id = normalise_requirements(items, batch_ids, spec_context)
+        # GraphRAG guard: a requirement must cite a clause that Neo4j retrieved
+        # for THIS category, otherwise it is rejected.
+        for c in batch:
+            allowed = c.get("graph_candidate_ids")
+            req = by_id[c["id"]]
+            if allowed is not None and req["spec_found"] and req["source_id"] not in allowed:
+                by_id[c["id"]] = empty_requirement(
+                    c["id"], "Rejected: cited clause was not retrieved from the graph for this category")
         ordered.extend(by_id[c["id"]] for c in batch)
         n_batches += 1
 
