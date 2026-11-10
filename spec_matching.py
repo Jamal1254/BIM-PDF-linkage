@@ -510,6 +510,34 @@ def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_
     return [(source_id, blocks[source_id]) for source_id in sorted(chosen_ids, key=sort_key)]
 
 
+# Categories that are a single layer of a wall build-up (insulation, coating,
+# render...). A clause giving the TOTAL thickness of a multi-layer assembly
+# cannot be applied to them. Extend this list for other naming conventions.
+SINGLE_LAYER_PATTERNS = (
+    r"\bwd\b", r"d(?:ä|ae|a)mm", r"insulation", r"beschichtung", r"coating",
+    r"putz", r"anstrich", r"\bpaint",
+)
+
+
+def _is_single_layer_category(category):
+    name = unicodedata.normalize("NFKC", str(category.get("key", ""))).casefold()
+    return any(re.search(pattern, name) for pattern in SINGLE_LAYER_PATTERNS)
+
+
+def assembly_thickness_misapplied(category, requirement, spec_context):
+    """True if a multi-layer assembly's total thickness was given to a single-layer category.
+
+    Deterministic rule: the cited clause lists 3+ different mm values and the
+    reported thickness equals the largest of them (the assembly total).
+    """
+    thickness = requirement.get("required_thickness_mm")
+    if thickness is None or not _is_single_layer_category(category):
+        return False
+    clause = _source_blocks(spec_context).get(requirement.get("source_id", ""), "")
+    values = {float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\s*mm", clause)}
+    return len(values) >= 3 and abs(float(thickness) - max(values)) <= 0.5
+
+
 def build_prompt(spec_context, batch, variant="A"):
     sections = []
     for category in batch:
@@ -579,6 +607,9 @@ def extract_requirements(client, spec_context, categories, variant="A"):
             if allowed is not None and req["spec_found"] and req["source_id"] not in allowed:
                 by_id[c["id"]] = empty_requirement(
                     c["id"], "Rejected: cited clause was not retrieved from the graph for this category")
+            elif req["spec_found"] and assembly_thickness_misapplied(c, req, spec_context):
+                by_id[c["id"]] = empty_requirement(
+                    c["id"], "Rejected: total thickness of a multi-layer assembly cannot be applied to a single-layer category")
         ordered.extend(by_id[c["id"]] for c in batch)
         n_batches += 1
 
