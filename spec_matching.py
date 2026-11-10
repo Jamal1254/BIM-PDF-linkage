@@ -18,6 +18,7 @@ This file has no Streamlit dependency, so it can be unit-tested on its own.
 """
 
 import json
+import os
 import re
 import unicodedata
 import time
@@ -26,7 +27,12 @@ from collections import Counter
 # ---------------------------------------------------------------------------
 # Configuration (kept in one place so it can be reported for reproducibility)
 # ---------------------------------------------------------------------------
-LLM_MODELS = ("gemini-3.8-flash", "gemini-3.5-flash-lite")  # stable; both free-tier listed
+# Primary model first. Set GEMINI_MODEL (secret / environment variable) to change
+# the primary without editing code; the others remain as fallbacks.
+LLM_MODELS = tuple(dict.fromkeys(
+    m for m in (os.environ.get("GEMINI_MODEL"), "gemini-3.8-flash", "gemini-3.5-flash-lite") if m
+))
+LLM_ERROR_LOG = []  # errors from the most recent mapping run (shown in the app)
 TEMPERATURE = None  # Gemini 3.x: do not override its recommended default
 SEED = None         # no reproducibility guarantee; test empirically
 THINKING_LEVEL = "low"
@@ -97,7 +103,12 @@ IFC_TERM_HINTS = (
 
 def _category_hints(key):
     name = unicodedata.normalize("NFKC", str(key)).casefold()
-    return ", ".join(dict.fromkeys(hint for term, hint in IFC_TERM_HINTS if term in name)) or "not available"
+    def _has(term):
+        # Very short codes (gk, stb, wd) must be whole words, not fragments of other words.
+        if len(term) <= 3:
+            return re.search(r"(?<![^\W\d_])" + re.escape(term) + r"(?![^\W\d_])", name) is not None
+        return term in name
+    return ", ".join(dict.fromkeys(hint for term, hint in IFC_TERM_HINTS if _has(term))) or "not available"
 
 PROMPT_VARIANTS = {
     "A": (
@@ -131,6 +142,9 @@ PROMPT_VARIANTS = {
         "8. If a clause describes a related but different construction/use, "
         "do not force a match. Prefer a justified false result over an "
         "unsupported requirement. Do not assess model compliance.\n\n"
+        "9. A category that describes EXISTING construction (for example "
+        "'Bestand' or 'existing') must not be matched to a clause for new "
+        "construction unless the clause itself refers to existing work.\n\n"
         "Return one result for every category ID, including false results."
     ),
     "B": (
@@ -145,7 +159,10 @@ PROMPT_VARIANTS = {
         "with total wall thickness or transfer a multi-leaf assembly dimension "
         "to one component. Return the exact source_id and a short contiguous "
         "verbatim quote from that same clause. If no candidate clearly applies, "
-        "return spec_found=false. Do not assess compliance. Return one result "
+        "return spec_found=false. A category describing EXISTING construction ("
+        "'Bestand', 'existing') must not be matched to a new-build clause "
+        "unless the clause itself refers to existing work. Do not assess "
+        "compliance. Return one result "
         "for every category ID."
     ),
 }
@@ -154,7 +171,7 @@ PROMPT_VARIANTS = {
 # ---------------------------------------------------------------------------
 # Gemini helpers
 # ---------------------------------------------------------------------------
-def _build_config(model, system_instruction, json_mode, max_tokens):
+def _build_config(model, system_instruction, json_mode, max_tokens, use_thinking=True):
     """Build a GenerateContentConfig, degrading gracefully on older SDKs."""
     from google.genai import types
 
@@ -164,7 +181,7 @@ def _build_config(model, system_instruction, json_mode, max_tokens):
     }
     if json_mode:
         kwargs["response_mime_type"] = "application/json"
-    if model.startswith("gemini-3."):
+    if model.startswith("gemini-3.") and use_thinking:
         # Current Gemini 3 guidance: don't set temperature=0 or thinking_budget.
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
     elif TEMPERATURE is not None:
@@ -181,37 +198,57 @@ def _response_text(response):
         return None
 
 
-def call_llm(client, prompt, system_instruction=SYSTEM_INSTRUCTION,
-             json_mode=True, max_tokens=8192, models=LLM_MODELS):
-    """Call supported Gemini models, retrying only transient API failures.
+def _status_code(exc):
+    """HTTP status of an API error, read from the exception (not guessed from digits in the text)."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
 
-    Invalid model names, bad API versions and authentication errors should
-    fail fast instead of wasting time on identical unsuccessful requests.
+
+def call_llm(client, prompt, system_instruction=SYSTEM_INSTRUCTION,
+             json_mode=True, max_tokens=8192, models=None):
+    """Call Gemini models in order; retry transient failures with back-off.
+
+    Transient = HTTP 429/5xx or a timeout: retried up to 4 times on the SAME
+    model before falling back. Other errors skip to the next model at once.
+    Every failure is appended to LLM_ERROR_LOG so the app can show why a
+    fallback model was used.
     """
+    models = tuple(models or LLM_MODELS)
     errors = []
     for model in models:
-        for attempt in range(2):
+        use_thinking = True
+        for attempt in range(4):
             try:
-                config = _build_config(model, system_instruction, json_mode, max_tokens)
+                config = _build_config(model, system_instruction, json_mode, max_tokens, use_thinking)
                 response = client.models.generate_content(
                     model=model, contents=prompt, config=config
                 )
                 output = _response_text(response)
                 if output and output.strip():
                     return output, model
-                errors.append(f"{model}: empty response")
+                entry = f"{model}: empty response"
+                errors.append(entry)
+                LLM_ERROR_LOG.append(entry)
                 break
             except Exception as exc:
-                error = str(exc)
-                errors.append(f"{model}: {error}")
-                low = error.lower()
-                fatal = any(code in low for code in
-                    ("400", "401", "403", "404", "invalid_argument", "not_found", "unauthenticated"))
-                retryable = not fatal and any(code in low for code in
-                    ("429", "500", "502", "503", "504", "resource_exhausted", "unavailable", "timeout"))
-                if not retryable or attempt == 1:
+                status = _status_code(exc)
+                message = str(exc)
+                entry = f"{model}: HTTP {status if status else '?'}: {message[:300]}"
+                errors.append(entry)
+                LLM_ERROR_LOG.append(entry)
+                low = message.lower()
+                if use_thinking and "thinking" in low and status in (400, None):
+                    use_thinking = False  # retry once without the thinking setting
+                    continue
+                transient = status in (429, 500, 502, 503, 504) or (
+                    status is None and any(w in low for w in
+                        ("timeout", "unavailable", "resource_exhausted", "connection")))
+                if not transient or attempt == 3:
                     break
-                time.sleep(2)
+                time.sleep((2, 6, 15)[attempt])
     raise RuntimeError("All Gemini calls failed. " + " | ".join(errors[-4:]))
 
 
@@ -438,6 +475,8 @@ def _category_clause_terms(category):
     key = unicodedata.normalize("NFKC", str(category.get("key", ""))).casefold()
     terms = set()
     hints = _category_hints(key).casefold()
+    if hints == "not available":
+        hints = ""
     for phrase in re.findall(r"[a-z][a-z -]{2,}", hints):
         phrase = phrase.strip()
         if phrase:
@@ -457,8 +496,31 @@ def _category_clause_terms(category):
         "maschendrahtzaun": ("chain link", "fence", "mesh"),
         "vorhang": ("curtain wall", "curtain", "glazing"),
     }
+    # Common English construction words (models are not always German).
+    aliases.update({
+        "partition": ("partition", "stud wall", "plasterboard", "drywall", "dry lining"),
+        "stud": ("stud wall", "partition", "plasterboard"),
+        "brick": ("brickwork", "masonry", "brick"),
+        "block": ("blockwork", "masonry", "block"),
+        "cmu": ("blockwork", "concrete masonry", "masonry"),
+        "concrete": ("concrete", "reinforced concrete", "cast in situ"),
+        "precast": ("precast concrete", "concrete"),
+        "insulation": ("insulation", "thermal insulation"),
+        "render": ("render", "plaster", "coating"),
+        "plaster": ("plaster", "plasterboard", "render"),
+        "gypsum": ("gypsum", "plasterboard", "drywall"),
+        "cavity": ("cavity wall", "cavity", "masonry"),
+        "curtain": ("curtain wall", "glazing"),
+        "party": ("party wall", "separating wall", "acoustic"),
+        "fire": ("fire resisting", "fire rating", "fire stopping"),
+        "timber": ("timber frame", "timber stud", "timber"),
+    })
     for source, values in aliases.items():
-        if source in key:
+        if len(source) <= 3:
+            found = re.search(r"(?<![^\W\d_])" + re.escape(source) + r"(?![^\W\d_])", key) is not None
+        else:
+            found = source in key
+        if found:
             terms.update(values)
     if category.get("is_external"):
         terms.update(("external wall", "external masonry", "external cavity"))
@@ -527,15 +589,34 @@ def _is_single_layer_category(category):
 def assembly_thickness_misapplied(category, requirement, spec_context):
     """True if a multi-layer assembly's total thickness was given to a single-layer category.
 
-    Deterministic rule: the cited clause lists 3+ different mm values and the
-    reported thickness equals the largest of them (the assembly total).
+    Deterministic rule: the cited clause lists 3+ mm dimensions and the reported
+    thickness equals the largest of them (the assembly total).
     """
     thickness = requirement.get("required_thickness_mm")
     if thickness is None or not _is_single_layer_category(category):
         return False
     clause = _source_blocks(spec_context).get(requirement.get("source_id", ""), "")
-    values = {float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\s*mm", clause)}
-    return len(values) >= 3 and abs(float(thickness) - max(values)) <= 0.5
+    values = [float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\s*mm", clause)]
+    # 3+ dimensions in the clause, and the reported value is the largest one
+    # (the assembly total) and larger than at least one component layer.
+    return (len(values) >= 3 and abs(float(thickness) - max(values)) <= 0.5
+            and max(values) > min(values))
+
+
+EXISTING_PATTERNS = (r"\bbestand\b", r"\bexisting\b", r"\babbruch\b", r"\bdemol")
+
+
+def _is_existing_category(category):
+    name = unicodedata.normalize("NFKC", str(category.get("key", ""))).casefold()
+    return any(re.search(pattern, name) for pattern in EXISTING_PATTERNS)
+
+
+def existing_construction_misapplied(category, requirement, spec_context):
+    """True if a clause for NEW work is applied to an existing-construction category."""
+    if not _is_existing_category(category):
+        return False
+    clause = _source_blocks(spec_context).get(requirement.get("source_id", ""), "")
+    return re.search(r"existing|bestand|retained|refurb", clause, re.IGNORECASE) is None
 
 
 def build_prompt(spec_context, batch, variant="A"):
@@ -573,6 +654,8 @@ def extract_requirements(client, spec_context, categories, variant="A"):
         raise ValueError(f"Unknown prompt variant: {variant}")
 
     ordered, raw_responses, model_used, n_batches = [], [], None, 0
+    models_used = []
+    del LLM_ERROR_LOG[:]
     candidate_clause_counts = {}
     candidate_clause_ids = {}
     for start in range(0, len(categories), BATCH_SIZE):
@@ -598,6 +681,7 @@ def extract_requirements(client, spec_context, categories, variant="A"):
                 f"Could not parse the LLM's JSON reply (batch {n_batches + 1}): {last_error}"
             )
 
+        models_used.append(model_used)
         by_id = normalise_requirements(items, batch_ids, spec_context)
         # GraphRAG guard: a requirement must cite a clause that Neo4j retrieved
         # for THIS category, otherwise it is rejected.
@@ -610,11 +694,18 @@ def extract_requirements(client, spec_context, categories, variant="A"):
             elif req["spec_found"] and assembly_thickness_misapplied(c, req, spec_context):
                 by_id[c["id"]] = empty_requirement(
                     c["id"], "Rejected: total thickness of a multi-layer assembly cannot be applied to a single-layer category")
+            elif req["spec_found"] and existing_construction_misapplied(c, req, spec_context):
+                by_id[c["id"]] = empty_requirement(
+                    c["id"], "Rejected: category describes existing construction; the cited clause describes new work")
         ordered.extend(by_id[c["id"]] for c in batch)
         n_batches += 1
 
     meta = {
         "model": model_used,
+        "primary_model": LLM_MODELS[0],
+        "models_used": sorted(set(models_used)),
+        "fallback_used": any(m != LLM_MODELS[0] for m in models_used),
+        "llm_error_log": list(LLM_ERROR_LOG)[-6:],
         "prompt_variant": variant,
         "prompt_revision": PROMPT_REVISION,
         "temperature": TEMPERATURE,
