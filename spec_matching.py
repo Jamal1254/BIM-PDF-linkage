@@ -20,28 +20,22 @@ This file has no Streamlit dependency, so it can be unit-tested on its own.
 import json
 import os
 import re
-import unicodedata
 import time
+import unicodedata
 from collections import Counter
 
-# ---------------------------------------------------------------------------
-# Configuration (kept in one place so it can be reported for reproducibility)
-# ---------------------------------------------------------------------------
-# Primary model first. Set GEMINI_MODEL (secret / environment variable) to change
-# the primary without editing code; the others remain as fallbacks.
 LLM_MODELS = tuple(dict.fromkeys(
     m for m in (os.environ.get("GEMINI_MODEL"), "gemini-3.8-flash", "gemini-3.5-flash-lite") if m
 ))
-LLM_ERROR_LOG = []  # errors from the most recent mapping run (shown in the app)
-TEMPERATURE = None  # Gemini 3.x: do not override its recommended default
-SEED = None         # no reproducibility guarantee; test empirically
+LLM_ERROR_LOG = []
+TEMPERATURE = None
+SEED = None
 THINKING_LEVEL = "low"
 PROMPT_REVISION = "candidate-retrieval-v2"
-BATCH_SIZE = 8                       # smaller batches improve category-level attention
-MAX_CANDIDATE_CLAUSES = 12            # relevant PDF clauses per IFC category
-MAX_REQUIRED_THICKNESS_MM = 2000.0   # anything above is treated as an LLM error
+BATCH_SIZE = 8
+MAX_CANDIDATE_CLAUSES = 12
+MAX_REQUIRED_THICKNESS_MM = 2000.0
 
-# rank -> (severity, issue type). Lower rank = more severe.
 ISSUE_RANKS = {
     1: ("Critical", "Geometry & material missing"),
     2: ("High", "Geometry missing"),
@@ -62,9 +56,6 @@ SEVERITY_COLOURS = {
     "Pass": "#B6E3B6",
 }
 
-# ---------------------------------------------------------------------------
-# Prompts. Two wordings are kept so prompt sensitivity can be measured.
-# ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = (
     "You extract construction-specification requirements from text. "
     "You never judge compliance and you never use information that is not "
@@ -80,9 +71,6 @@ OUTPUT_FORMAT = (
     '"source_id": <string>}]}'
 )
 
-
-# Explanatory translations of IFC labels, NOT evidence that a requirement applies.
-# Model widths/material values are not passed to the LLM.
 IFC_TERM_HINTS = (
     ("mauerwerk", "masonry"),
     ("ziegel", "brickwork"),
@@ -103,12 +91,14 @@ IFC_TERM_HINTS = (
 
 def _category_hints(key):
     name = unicodedata.normalize("NFKC", str(key)).casefold()
+
     def _has(term):
-        # Very short codes (gk, stb, wd) must be whole words, not fragments of other words.
         if len(term) <= 3:
             return re.search(r"(?<![^\W\d_])" + re.escape(term) + r"(?![^\W\d_])", name) is not None
         return term in name
+
     return ", ".join(dict.fromkeys(hint for term, hint in IFC_TERM_HINTS if _has(term))) or "not available"
+
 
 PROMPT_VARIANTS = {
     "A": (
@@ -168,11 +158,7 @@ PROMPT_VARIANTS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Gemini helpers
-# ---------------------------------------------------------------------------
 def _build_config(model, system_instruction, json_mode, max_tokens, use_thinking=True):
-    """Build a GenerateContentConfig, degrading gracefully on older SDKs."""
     from google.genai import types
 
     kwargs = {
@@ -182,7 +168,6 @@ def _build_config(model, system_instruction, json_mode, max_tokens, use_thinking
     if json_mode:
         kwargs["response_mime_type"] = "application/json"
     if model.startswith("gemini-3.") and use_thinking:
-        # Current Gemini 3 guidance: don't set temperature=0 or thinking_budget.
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
     elif TEMPERATURE is not None:
         kwargs["temperature"] = TEMPERATURE
@@ -199,7 +184,6 @@ def _response_text(response):
 
 
 def _status_code(exc):
-    """HTTP status of an API error, read from the exception (not guessed from digits in the text)."""
     code = getattr(exc, "code", None)
     if isinstance(code, int):
         return code
@@ -208,15 +192,9 @@ def _status_code(exc):
 
 
 def call_llm(client, prompt, system_instruction=SYSTEM_INSTRUCTION,
-             json_mode=True, max_tokens=8192, models=None):
-    """Call Gemini models in order; retry transient failures with back-off.
-
-    Transient = HTTP 429/5xx or a timeout: retried up to 4 times on the SAME
-    model before falling back. Other errors skip to the next model at once.
-    Every failure is appended to LLM_ERROR_LOG so the app can show why a
-    fallback model was used.
-    """
+             json_mode=True, max_tokens=8192, models=None, error_log=None):
     models = tuple(models or LLM_MODELS)
+    log_target = error_log if error_log is not None else LLM_ERROR_LOG
     errors = []
     for model in models:
         use_thinking = True
@@ -231,17 +209,17 @@ def call_llm(client, prompt, system_instruction=SYSTEM_INSTRUCTION,
                     return output, model
                 entry = f"{model}: empty response"
                 errors.append(entry)
-                LLM_ERROR_LOG.append(entry)
+                log_target.append(entry)
                 break
             except Exception as exc:
                 status = _status_code(exc)
                 message = str(exc)
                 entry = f"{model}: HTTP {status if status else '?'}: {message[:300]}"
                 errors.append(entry)
-                LLM_ERROR_LOG.append(entry)
+                log_target.append(entry)
                 low = message.lower()
                 if use_thinking and "thinking" in low and status in (400, None):
-                    use_thinking = False  # retry once without the thinking setting
+                    use_thinking = False
                     continue
                 transient = status in (429, 500, 502, 503, 504) or (
                     status is None and any(w in low for w in
@@ -253,7 +231,6 @@ def call_llm(client, prompt, system_instruction=SYSTEM_INSTRUCTION,
 
 
 def parse_json_response(text):
-    """Return the 'requirements' list from the model's JSON reply."""
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.I).strip()
     try:
@@ -270,42 +247,23 @@ def parse_json_response(text):
     return data["requirements"]
 
 
-# ---------------------------------------------------------------------------
-# M3: requirement mapping
-# ---------------------------------------------------------------------------
 def _alnum(text):
-    """Canonically compare PDF quotations despite spacing / ligatures.
-
-    This is still a strict text check, NOT a fuzzy semantic match: extra or
-    invented words never pass. NFKC handles PDF superscripts and ligatures.
-    """
     normal = unicodedata.normalize("NFKC", str(text)).casefold()
     return re.sub(r"[^a-z0-9]+", "", normal)
 
 
 def verify_source_quote(quote, context):
-    """True only for a substantive continuous quotation found in source text.
-
-    Page headers occur only between pages after app.py's retrieval fix.
-    Requiring >= 15 canonical characters rejects meaningless placeholders.
-    """
     needle = _alnum(quote)
     return len(needle) >= 15 and needle in _alnum(context or "")
 
 
 def _source_blocks(context):
-    """Resolve source IDs to exact PDF excerpts annotated by app.py.
-
-    IDs are unique per input PDF page and bullet clause. If an LLM gives an
-    invalid ID we do not accept its claim of evidence.
-    """
     raw = context or ""
     pattern = list(re.finditer(r"\[(P[0-9]+-C[0-9]+)\]\s*", raw))
     blocks = {}
     for i, found in enumerate(pattern):
         end = pattern[i + 1].start() if i + 1 < len(pattern) else len(raw)
         value = raw[found.end():end].strip()
-        # Do not treat the next page header as part of the last clause.
         value = re.split(r"\s*\[Page\s+[0-9]+\]", value, maxsplit=1)[0].strip()
         if value:
             blocks[found.group(1)] = value
@@ -313,7 +271,6 @@ def _source_blocks(context):
 
 
 def _source_has_thickness(text, thickness_mm):
-    """Verify a stated overall thickness exists in the selected clause."""
     if thickness_mm is None:
         return False
     normal = unicodedata.normalize("NFKC", text).lower()
@@ -325,7 +282,6 @@ def _source_has_thickness(text, thickness_mm):
 
 
 def _source_supported_materials(materials, clause_text):
-    """Keep material names explicitly evidenced by the selected excerpt."""
     valid = []
     for material in materials:
         words = [w for w in re.findall(r"[a-z]{4,}", material.lower())
@@ -336,7 +292,6 @@ def _source_supported_materials(materials, clause_text):
 
 
 def _source_quote_from_clause(source, thickness_mm):
-    """Return real PDF wording, centred on the cited dimension when possible."""
     pos = 0
     if thickness_mm is not None:
         matches = list(re.finditer(r"\b[0-9]+(?:[.,][0-9]+)?\s*(?:mm|cm|m)\b", source, flags=re.I))
@@ -382,7 +337,6 @@ def empty_requirements(categories, note=""):
 
 
 def normalise_requirements(items, batch_ids, spec_context):
-    """Validate the LLM output. Returns {category_id: requirement_dict}."""
     out = {}
     available_sources = _source_blocks(spec_context)
     for item in items:
@@ -411,16 +365,11 @@ def normalise_requirements(items, batch_ids, spec_context):
         required_t = _to_thickness(item.get("required_thickness_mm"))
         note = ""
         if clause_text:
-            # Use a verbatim excerpt recovered from our source text, not the
-            # model's paraphrase. This removes the root cause of false quote
-            # rejections while preserving source traceability.
             quote = _source_quote_from_clause(clause_text, required_t)
             verified = True
             if required_t is not None and not _source_has_thickness(clause_text, required_t):
                 note = "Reported thickness not present in cited clause; thickness discarded"
                 required_t = None
-            # Materials not present in the cited clause cannot form a tested
-            # requirement. Do not silently trust model-generated material lists.
             valid_materials = _source_supported_materials(clean_materials, clause_text)
             if len(valid_materials) != len(clean_materials):
                 note = (note + "; " if note else "") + "Unverified materials excluded"
@@ -430,8 +379,6 @@ def normalise_requirements(items, batch_ids, spec_context):
             if source_id and not verified:
                 note = "Source clause ID was invalid and the quotation was not verified"
             if verified:
-                # Legacy model responses that omit source_id are accepted only
-                # when the quoted excerpt itself proves the reported details.
                 if required_t is not None and not _source_has_thickness(quote, required_t):
                     note = (note + "; " if note else "") + "Thickness not supported by evidence quote"
                     required_t = None
@@ -452,8 +399,6 @@ def normalise_requirements(items, batch_ids, spec_context):
             "note": note,
         }
         if spec_found and not verified:
-            # A model-generated requirement without traceable source evidence
-            # must never be used to assert compliance or non-compliance.
             req["spec_found"] = False
             req["note"] = "Unsupported requirement rejected: evidence quote not found in supplied text"
         if spec_found and verified and required_t is None and not clean_materials:
@@ -471,7 +416,6 @@ def normalise_requirements(items, batch_ids, spec_context):
 
 
 def _category_clause_terms(category):
-    """Return construction terms used only to retrieve candidate PDF clauses."""
     key = unicodedata.normalize("NFKC", str(category.get("key", ""))).casefold()
     terms = set()
     hints = _category_hints(key).casefold()
@@ -482,7 +426,6 @@ def _category_clause_terms(category):
         if phrase:
             terms.add(phrase)
 
-    # German IFC type labels and their common construction equivalents.
     aliases = {
         "trockenbau": ("drywall", "dry lining", "plasterboard", "gypsum", "stud wall", "partition"),
         "gk": ("gypsum", "plasterboard", "drywall", "dry lining", "stud wall", "partition"),
@@ -496,7 +439,6 @@ def _category_clause_terms(category):
         "maschendrahtzaun": ("chain link", "fence", "mesh"),
         "vorhang": ("curtain wall", "curtain", "glazing"),
     }
-    # Common English construction words (models are not always German).
     aliases.update({
         "partition": ("partition", "stud wall", "plasterboard", "drywall", "dry lining"),
         "stud": ("stud wall", "partition", "plasterboard"),
@@ -527,11 +469,8 @@ def _category_clause_terms(category):
     return sorted(terms, key=len, reverse=True)
 
 
-def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_CLAUSES):
-    """Rank source-identified PDF clauses for one category; never decides applicability."""
-    blocks = _source_blocks(spec_context)
-    # GraphRAG mode: Neo4j already chose this category's candidates. Use exactly
-    # those clauses; no keyword fallback outside the graph.
+def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_CLAUSES, _blocks=None):
+    blocks = _blocks if _blocks is not None else _source_blocks(spec_context)
     graph_ids = category.get("graph_candidate_ids")
     if graph_ids is not None:
         def _order(source_id):
@@ -546,14 +485,11 @@ def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_
         for term in terms:
             if term in low:
                 score += 4 if " " in term else 2
-        # Numeric suffixes in IFC type names are deliberately not used for
-        # retrieval: a shared number (e.g. 100 mm) is not evidence of applicability.
         if score:
             scored.append((score, source_id, clause))
 
     scored.sort(key=lambda item: (-item[0], item[1]))
     selected = scored[:limit]
-    # Include immediately adjacent clauses on the same page for section context.
     chosen_ids = {source_id for _, source_id, _ in selected}
     for _, source_id, _ in selected[:]:
         match = re.fullmatch(r"P(\d+)-C(\d+)", source_id)
@@ -572,9 +508,6 @@ def _candidate_clauses_for_category(category, spec_context, limit=MAX_CANDIDATE_
     return [(source_id, blocks[source_id]) for source_id in sorted(chosen_ids, key=sort_key)]
 
 
-# Categories that are a single layer of a wall build-up (insulation, coating,
-# render...). A clause giving the TOTAL thickness of a multi-layer assembly
-# cannot be applied to them. Extend this list for other naming conventions.
 SINGLE_LAYER_PATTERNS = (
     r"\bwd\b", r"d(?:ä|ae|a)mm", r"insulation", r"beschichtung", r"coating",
     r"putz", r"anstrich", r"\bpaint",
@@ -586,19 +519,13 @@ def _is_single_layer_category(category):
     return any(re.search(pattern, name) for pattern in SINGLE_LAYER_PATTERNS)
 
 
-def assembly_thickness_misapplied(category, requirement, spec_context):
-    """True if a multi-layer assembly's total thickness was given to a single-layer category.
-
-    Deterministic rule: the cited clause lists 3+ mm dimensions and the reported
-    thickness equals the largest of them (the assembly total).
-    """
+def assembly_thickness_misapplied(category, requirement, spec_context, _blocks=None):
     thickness = requirement.get("required_thickness_mm")
     if thickness is None or not _is_single_layer_category(category):
         return False
-    clause = _source_blocks(spec_context).get(requirement.get("source_id", ""), "")
+    blocks = _blocks if _blocks is not None else _source_blocks(spec_context)
+    clause = blocks.get(requirement.get("source_id", ""), "")
     values = [float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\s*mm", clause)]
-    # 3+ dimensions in the clause, and the reported value is the largest one
-    # (the assembly total) and larger than at least one component layer.
     return (len(values) >= 3 and abs(float(thickness) - max(values)) <= 0.5
             and max(values) > min(values))
 
@@ -611,15 +538,16 @@ def _is_existing_category(category):
     return any(re.search(pattern, name) for pattern in EXISTING_PATTERNS)
 
 
-def existing_construction_misapplied(category, requirement, spec_context):
-    """True if a clause for NEW work is applied to an existing-construction category."""
+def existing_construction_misapplied(category, requirement, spec_context, _blocks=None):
     if not _is_existing_category(category):
         return False
-    clause = _source_blocks(spec_context).get(requirement.get("source_id", ""), "")
+    blocks = _blocks if _blocks is not None else _source_blocks(spec_context)
+    clause = blocks.get(requirement.get("source_id", ""), "")
     return re.search(r"existing|bestand|retained|refurb", clause, re.IGNORECASE) is None
 
 
-def build_prompt(spec_context, batch, variant="A"):
+def build_prompt(spec_context, batch, variant="A", candidates_by_id=None, _blocks=None):
+    blocks = _blocks if _blocks is not None else _source_blocks(spec_context)
     sections = []
     for category in batch:
         external = "Yes" if category.get("is_external") else "No / unspecified"
@@ -629,7 +557,10 @@ def build_prompt(spec_context, batch, variant="A"):
             f'ifc_class={category["ifc_class"]} | external={external} | '
             f'english_label_hints={hints}'
         )
-        candidates = _candidate_clauses_for_category(category, spec_context)
+        if candidates_by_id is not None and category["id"] in candidates_by_id:
+            candidates = candidates_by_id[category["id"]]
+        else:
+            candidates = _candidate_clauses_for_category(category, spec_context, _blocks=blocks)
         if candidates:
             sections.extend(f"[{source_id}] {text}" for source_id, text in candidates)
         else:
@@ -644,32 +575,30 @@ def build_prompt(spec_context, batch, variant="A"):
 
 
 def extract_requirements(client, spec_context, categories, variant="A"):
-    """Map every category to a requirement using the LLM.
-
-    Returns (requirements_in_category_order, metadata).
-    The model's own thickness and material values are deliberately NOT sent,
-    so the LLM cannot simply agree with the model.
-    """
     if variant not in PROMPT_VARIANTS:
         raise ValueError(f"Unknown prompt variant: {variant}")
 
     ordered, raw_responses, model_used, n_batches = [], [], None, 0
     models_used = []
-    del LLM_ERROR_LOG[:]
+    run_errors = []
+    LLM_ERROR_LOG.clear()
+    blocks = _source_blocks(spec_context)
     candidate_clause_counts = {}
     candidate_clause_ids = {}
     for start in range(0, len(categories), BATCH_SIZE):
         batch = categories[start:start + BATCH_SIZE]
         batch_ids = {c["id"] for c in batch}
-        prompt = build_prompt(spec_context, batch, variant)
+        batch_candidates = {}
         for category in batch:
-            candidates = _candidate_clauses_for_category(category, spec_context)
+            candidates = _candidate_clauses_for_category(category, spec_context, _blocks=blocks)
+            batch_candidates[category["id"]] = candidates
             candidate_clause_counts[category["id"]] = len(candidates)
             candidate_clause_ids[category["id"]] = [source_id for source_id, _ in candidates]
+        prompt = build_prompt(spec_context, batch, variant, candidates_by_id=batch_candidates, _blocks=blocks)
 
         items, last_error = None, None
         for _attempt in range(2):
-            text, model_used = call_llm(client, prompt)
+            text, model_used = call_llm(client, prompt, error_log=run_errors)
             raw_responses.append(text)
             try:
                 items = parse_json_response(text)
@@ -677,35 +606,35 @@ def extract_requirements(client, spec_context, categories, variant="A"):
             except ValueError as exc:
                 last_error = exc
         if items is None:
+            LLM_ERROR_LOG.extend(run_errors)
             raise RuntimeError(
                 f"Could not parse the LLM's JSON reply (batch {n_batches + 1}): {last_error}"
             )
 
         models_used.append(model_used)
         by_id = normalise_requirements(items, batch_ids, spec_context)
-        # GraphRAG guard: a requirement must cite a clause that Neo4j retrieved
-        # for THIS category, otherwise it is rejected.
         for c in batch:
             allowed = c.get("graph_candidate_ids")
             req = by_id[c["id"]]
             if allowed is not None and req["spec_found"] and req["source_id"] not in allowed:
                 by_id[c["id"]] = empty_requirement(
                     c["id"], "Rejected: cited clause was not retrieved from the graph for this category")
-            elif req["spec_found"] and assembly_thickness_misapplied(c, req, spec_context):
+            elif req["spec_found"] and assembly_thickness_misapplied(c, req, spec_context, _blocks=blocks):
                 by_id[c["id"]] = empty_requirement(
                     c["id"], "Rejected: total thickness of a multi-layer assembly cannot be applied to a single-layer category")
-            elif req["spec_found"] and existing_construction_misapplied(c, req, spec_context):
+            elif req["spec_found"] and existing_construction_misapplied(c, req, spec_context, _blocks=blocks):
                 by_id[c["id"]] = empty_requirement(
                     c["id"], "Rejected: category describes existing construction; the cited clause describes new work")
         ordered.extend(by_id[c["id"]] for c in batch)
         n_batches += 1
 
+    LLM_ERROR_LOG.extend(run_errors)
     meta = {
         "model": model_used,
         "primary_model": LLM_MODELS[0],
         "models_used": sorted(set(models_used)),
         "fallback_used": any(m != LLM_MODELS[0] for m in models_used),
-        "llm_error_log": list(LLM_ERROR_LOG)[-6:],
+        "llm_error_log": run_errors[-6:],
         "prompt_variant": variant,
         "prompt_revision": PROMPT_REVISION,
         "temperature": TEMPERATURE,
@@ -720,9 +649,6 @@ def extract_requirements(client, spec_context, categories, variant="A"):
     return ordered, meta
 
 
-# ---------------------------------------------------------------------------
-# M4: deterministic matching and severity
-# ---------------------------------------------------------------------------
 _STOP_WORDS = {"and", "the", "with", "for", "type", "grade", "class",
                "standard", "min", "max", "minimum", "maximum"}
 _SYNONYMS = {"blockwork": "block", "cmu": "block", "drywall": "plasterboard",
@@ -742,11 +668,6 @@ def _tokens(text):
 
 
 def match_materials(required, model_names):
-    """Return (matched, unmatched) required materials.
-
-    A required material counts as found when every significant word of it
-    appears somewhere in the model's material names (all layers pooled).
-    """
     model_tokens = set()
     for name in model_names:
         model_tokens |= _tokens(name)
@@ -754,7 +675,7 @@ def match_materials(required, model_names):
     for req in required:
         req_tokens = _tokens(req)
         if not req_tokens:
-            continue  # nothing checkable in this phrase
+            continue
         (matched if req_tokens <= model_tokens else unmatched).append(req)
     return matched, unmatched
 
@@ -764,7 +685,6 @@ def _fmt(number):
 
 
 def evaluate_element(element, requirement, tolerance_mm):
-    """Classify one IFC element. Pure function: same input -> same output."""
     requirement = requirement or {}
     spec_found = bool(requirement.get("spec_found"))
     req_t = requirement.get("required_thickness_mm") if spec_found else None
@@ -776,7 +696,6 @@ def evaluate_element(element, requirement, tolerance_mm):
     delta = None
     matched, unmatched = [], []
 
-    # --- geometry state --------------------------------------------------
     if width is None:
         geometry = "missing"
         if element.get("WidthStatus") == "unreliable":
@@ -799,7 +718,6 @@ def evaluate_element(element, requirement, tolerance_mm):
                 f"(diff {delta:+g} mm, tolerance +/-{_fmt(tolerance_mm)} mm)"
             )
 
-    # --- material state --------------------------------------------------
     if not names:
         material = "missing"
         notes.append("Material missing: no named material associated in the model")
@@ -815,7 +733,6 @@ def evaluate_element(element, requirement, tolerance_mm):
         else:
             material = "ok"
 
-    # --- severity ----------------------------------------------------------
     if geometry == "missing" and material == "missing":
         rank = 1
     elif geometry == "missing":
@@ -858,9 +775,6 @@ def evaluate_element(element, requirement, tolerance_mm):
     }
 
 
-# ---------------------------------------------------------------------------
-# Reliability tests (repeatability and prompt sensitivity)
-# ---------------------------------------------------------------------------
 def _signature(req):
     materials = tuple(sorted({m.strip().lower() for m in req.get("required_materials", []) if m.strip()}))
     thickness = req.get("required_thickness_mm")
@@ -878,11 +792,6 @@ def _describe(signature):
 
 def run_repeatability(client, spec_context, categories, n_runs=5, variant="A",
                       progress_cb=None):
-    """Repeat the LLM mapping n_runs times on identical input.
-
-    Agreement per category = share of runs that returned the most common
-    answer (thickness, materials, spec_found).
-    """
     runs = []
     for i in range(n_runs):
         reqs, _meta = extract_requirements(client, spec_context, categories, variant)
@@ -914,7 +823,6 @@ def run_repeatability(client, spec_context, categories, n_runs=5, variant="A",
 
 def compare_prompt_variants(client, spec_context, categories, variants=("A", "B"),
                             progress_cb=None):
-    """Run each prompt wording once and compare the extracted requirements."""
     results = {}
     for i, variant in enumerate(variants):
         reqs, _meta = extract_requirements(client, spec_context, categories, variant)
@@ -942,9 +850,6 @@ def compare_prompt_variants(client, spec_context, categories, variants=("A", "B"
     return {"table": rows, "summary": summary}
 
 
-# ---------------------------------------------------------------------------
-# Optional narrative (the LLM only explains results that Python already decided)
-# ---------------------------------------------------------------------------
 NARRATIVE_SYSTEM = (
     "You are a senior BIM compliance auditor writing for a BIM coordinator. "
     "The severity classes below were computed by a deterministic program. "
